@@ -132,3 +132,63 @@ jobs:
         uses: github/codeql-action/analyze@v4
         with:
           category: "/language:java-kotlin"
+  
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test               # si los tests fallan, ni siquiera se construye la imagen
+
+    permissions:
+      contents: read
+      security-events: write  # para subir el reporte a la pestaña Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7     # necesitamos el Dockerfile
+
+      # Trae el .jar que generó el job build (mismo name: app-jar)
+      - name: Download JAR
+        uses: actions/download-artifact@v8
+        with:
+          name: app-jar
+          path: build/libs            # justo donde el Dockerfile lo busca
+
+      - name: Build Docker image (local, sin publicar)
+        run: docker build -t app:scan .
+
+      # Pasada 1: reporte completo en formato SARIF (no falla el job)
+      - name: Trivy scan - SARIF report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:scan
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      # Pasada 2: la "compuerta" de seguridad. Si hay CRITICAL con parche disponible, FALLA
+      - name: Trivy gate - fail on CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:scan
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # Solo llega aquí si pasó el escaneo: guardamos EXACTAMENTE esta imagen
+      - name: Save scanned image
+        run: docker save app:scan -o image.tar
+
+      - name: Upload scanned image
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
