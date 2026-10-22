@@ -103,3 +103,32 @@ jobs:
           name: test-reports
           path: build/reports/tests/
           retention-days: 7
+  
+  codeql:
+    name: CodeQL Security Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Permisos propios de ESTE job (reemplazan a los globales)
+    permissions:
+      contents: read
+      actions: read
+      security-events: write   # necesario para publicar hallazgos en la pestaña Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 1. Prepara CodeQL: idioma, modo y conjunto de reglas
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: none            # analiza el código fuente sin compilar
+          queries: security-extended  # más reglas que el set por defecto
+
+      # 2. Ejecuta las queries y sube los resultados a GitHub
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:java-kotlin"
