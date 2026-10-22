@@ -1,0 +1,260 @@
+name: CI - Build, Test & Docker
+
+# se ejecuta en cada pull request a main
+on:
+  pull_request:
+    branches: [ main ]
+
+# Principio de mínimo privilegio: solo leer código y escribir paquetes 
+permissions:
+  contents: read
+  packages: write
+
+# Variables reutilizables en todos los jobs
+env:
+  JAVA_VERSION: '25'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # 1. Descarga el código del repo en la máquina virtual (empieza vacía)
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 2. Instala Java 25 y activa la caché de dependencias de Gradle
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      # 3. Git a veces pierde el permiso de ejecución del wrapper
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # 4. Compila y empaqueta el .jar SIN correr tests (eso es tarea del job test)
+      - name: Build JAR
+        run: ./gradlew bootJar --no-daemon
+
+      # 5. Guarda el .jar para que el job de Docker pueda usarlo después
+      - name: Upload JAR
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-jar
+          path: build/libs/*-SNAPSHOT.jar
+          retention-days: 7
+
+    
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build          # No arranca hasta que "build" termine con éxito
+
+    # Contenedor de PostgreSQL que vive mientras dure este job
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ${{ secrets.DB_NAME }}
+          POSTGRES_USER: ${{ secrets.DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        ports:
+          - 5434:5432     # puerto_del_runner:puerto_del_contenedor (igual que tu .env)
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # Spring Boot lee estas variables y tienen prioridad sobre application.yaml
+    env:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5434/${{ secrets.DB_NAME }}
+      SPRING_DATASOURCE_USERNAME: ${{ secrets.DB_USER }}
+      SPRING_DATASOURCE_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Run tests
+        run: ./gradlew test --no-daemon
+
+      # Sube el reporte HTML de pruebas SIEMPRE, incluso si fallaron (para ver por qué)
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: build/reports/tests/
+          retention-days: 7
+  
+  codeql:
+    name: CodeQL Security Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Permisos propios de ESTE job (reemplazan a los globales)
+    permissions:
+      contents: read
+      actions: read
+      security-events: write   # necesario para publicar hallazgos en la pestaña Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 1. Prepara CodeQL: idioma, modo y conjunto de reglas
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: java-kotlin
+          build-mode: none            # analiza el código fuente sin compilar
+          queries: security-extended  # más reglas que el set por defecto
+
+      # 2. Ejecuta las queries y sube los resultados a GitHub
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:java-kotlin"
+  
+  trivy-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: test               # si los tests fallan, ni siquiera se construye la imagen
+
+    permissions:
+      contents: read
+      security-events: write  # para subir el reporte a la pestaña Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7     # necesitamos el Dockerfile
+
+      # Trae el .jar que generó el job build (mismo name: app-jar)
+      - name: Download JAR
+        uses: actions/download-artifact@v8
+        with:
+          name: app-jar
+          path: build/libs            # justo donde el Dockerfile lo busca
+
+      - name: Build Docker image (local, sin publicar)
+        run: docker build -t app:scan .
+
+      # Pasada 1: reporte completo en formato SARIF (no falla el job)
+      - name: Trivy scan - SARIF report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:scan
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      # Pasada 2: la "compuerta" de seguridad. Si hay CRITICAL con parche disponible, FALLA
+      - name: Trivy gate - fail on CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: app:scan
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # Solo llega aquí si pasó el escaneo: guardamos esta imagen
+      - name: Save scanned image
+        run: docker save app:scan -o image.tar
+
+      - name: Upload scanned image
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 1
+  
+  docker-publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [trivy-scan, codeql]   # SOLO si la imagen y el código pasaron seguridad
+
+    permissions:
+      contents: read
+      packages: write             # permiso para escribir en GHCR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7     # para leer la versión de build.gradle
+
+      # 1. Extrae la versión: version = '0.0.1-SNAPSHOT'  ->  v0.0.1
+      - name: Read app version from build.gradle
+        id: version
+        run: |
+          VERSION=$(grep -oP "^version = '\K[^']+" build.gradle | sed 's/-SNAPSHOT//')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Versión detectada: v${VERSION}"
+
+      # 2. Calcula todas las etiquetas
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_PR_HEAD_SHA: true   # usa el SHA de TU commit, no el merge temporal del PR
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=ref,event=pr
+
+      # 3. Trae la imagen EXACTA que Trivy escaneó
+      - name: Download scanned image
+        uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      # 4. Autenticarse en GHCR con el token automático (no hace falta crear un secret)
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. Etiquetar y publicar cada tag
+      - name: Tag and push
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "$TAGS" | while read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Publicando $tag"
+            docker tag app:scan "$tag"
+            docker push "$tag"
+          done
