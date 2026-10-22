@@ -182,7 +182,7 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
 
-      # Solo llega aquí si pasó el escaneo: guardamos EXACTAMENTE esta imagen
+      # Solo llega aquí si pasó el escaneo: guardamos esta imagen
       - name: Save scanned image
         run: docker save app:scan -o image.tar
 
@@ -192,3 +192,69 @@ jobs:
           name: docker-image
           path: image.tar
           retention-days: 1
+  
+  docker-publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [trivy-scan, codeql]   # SOLO si la imagen y el código pasaron seguridad
+
+    permissions:
+      contents: read
+      packages: write             # permiso para escribir en GHCR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7     # para leer la versión de build.gradle
+
+      # 1. Extrae la versión: version = '0.0.1-SNAPSHOT'  ->  v0.0.1
+      - name: Read app version from build.gradle
+        id: version
+        run: |
+          VERSION=$(grep -oP "^version = '\K[^']+" build.gradle | sed 's/-SNAPSHOT//')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Versión detectada: v${VERSION}"
+
+      # 2. Calcula todas las etiquetas
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_PR_HEAD_SHA: true   # usa el SHA de TU commit, no el merge temporal del PR
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=ref,event=pr
+
+      # 3. Trae la imagen EXACTA que Trivy escaneó
+      - name: Download scanned image
+        uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      # 4. Autenticarse en GHCR con el token automático (no hace falta crear un secret)
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. Etiquetar y publicar cada tag
+      - name: Tag and push
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          echo "$TAGS" | while read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Publicando $tag"
+            docker tag app:scan "$tag"
+            docker push "$tag"
+          done
