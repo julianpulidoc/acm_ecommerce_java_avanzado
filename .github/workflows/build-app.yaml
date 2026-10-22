@@ -1,0 +1,105 @@
+name: CI - Build, Test & Docker
+
+# se ejecuta en cada pull request a main
+on:
+  pull_request:
+    branches: [ main ]
+
+# Principio de mínimo privilegio: solo leer código y escribir paquetes 
+permissions:
+  contents: read
+  packages: write
+
+# Variables reutilizables en todos los jobs
+env:
+  JAVA_VERSION: '25'
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # 1. Descarga el código del repo en la máquina virtual (empieza vacía)
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # 2. Instala Java 25 y activa la caché de dependencias de Gradle
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      # 3. Git a veces pierde el permiso de ejecución del wrapper
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      # 4. Compila y empaqueta el .jar SIN correr tests (eso es tarea del job test)
+      - name: Build JAR
+        run: ./gradlew bootJar --no-daemon
+
+      # 5. Guarda el .jar para que el job de Docker pueda usarlo después
+      - name: Upload JAR
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-jar
+          path: build/libs/*-SNAPSHOT.jar
+          retention-days: 7
+
+    
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build          # No arranca hasta que "build" termine con éxito
+
+    # Contenedor de PostgreSQL que vive mientras dure este job
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ${{ secrets.DB_NAME }}
+          POSTGRES_USER: ${{ secrets.DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        ports:
+          - 5434:5432     # puerto_del_runner:puerto_del_contenedor (igual que tu .env)
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    # Spring Boot lee estas variables y tienen prioridad sobre application.yaml
+    env:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5434/${{ secrets.DB_NAME }}
+      SPRING_DATASOURCE_USERNAME: ${{ secrets.DB_USER }}
+      SPRING_DATASOURCE_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Run tests
+        run: ./gradlew test --no-daemon
+
+      # Sube el reporte HTML de pruebas SIEMPRE, incluso si fallaron (para ver por qué)
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: build/reports/tests/
+          retention-days: 7
