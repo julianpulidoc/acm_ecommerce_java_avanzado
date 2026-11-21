@@ -1,20 +1,22 @@
+server:
+  # Render inyecta la variable PORT; en local se usa 8080
+  port: ${PORT:8080}
 spring:
   application:
     name: ecommerce
   datasource:
-    url: jdbc:postgresql://localhost:5434/ecommerce
-    username: store
-    password: '123456'
+    # Se sobreescriben con variables de entorno (docker compose, CI, Render)
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5434/ecommerce}
+    username: ${SPRING_DATASOURCE_USERNAME:store}
+    password: ${SPRING_DATASOURCE_PASSWORD:123456}
     driver-class-name: org.postgresql.Driver
   jpa:
+    open-in-view: false
     hibernate:
       ddl-auto: update
-    show-sql: true
-    properties:
-      hibernate:
-        format_sql: true
+    show-sql: false
 springdoc:
   api-docs:
     path: /api/v1/api-docs
   swagger-ui:
-    path: /api/v1/api-docs
+    path: /swagger-ui.html
