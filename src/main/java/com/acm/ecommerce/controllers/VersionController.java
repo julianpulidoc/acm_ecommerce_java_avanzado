@@ -18,9 +18,12 @@ public class VersionController {
     private final String commit;
 
     public VersionController(@Value("${app.message}") String message,
-                             @Value("${APP_COMMIT:local}") String commit) {
+                             @Value("${APP_COMMIT:local}") String appCommit,
+                             @Value("${RENDER_GIT_COMMIT:}") String renderCommit) {
         this.message = message;
-        this.commit = commit;
+        this.commit = (appCommit != null && !appCommit.equals("local"))
+                ? appCommit
+                : (renderCommit != null && !renderCommit.isBlank() ? renderCommit : "local");
     }
 
     @GetMapping("/version")
