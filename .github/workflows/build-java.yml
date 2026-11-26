@@ -1,85 +1,47 @@
-name: CI
+name: CI/CD
 
 on:
   push:
     branches: [ "*" ]
   pull_request:
-    branches: [ "*" ]
+    branches: [ main ]
 
-# Concurrency: cancel older runs for the same branch/PR
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: write
+
+env:
+  JAVA_VERSION: "25"
+
 jobs:
-  build:
+  # ---------------------------------------------------------------------------
+  # 1 · Compilar y probar (CI)
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: "1 · Compilar y probar"
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
-    # -----------------------------------------------------------------------
-    # Permisos necesarios para subir (push) la imagen Docker a GitHub Packages
-    # -----------------------------------------------------------------------
-    permissions:
-      contents: read
-      packages: write
-    # NOTE: No "services:" block here.
-    # PostgreSQL is started inside a step (step 5) so that
-    # ${{ secrets.* }} are available when the container is created.
-
     steps:
-      # ---------------------------------------------------------------
-      # 1 Checkout repository
-      # ---------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------------------------------------------------------------
-      # 2 Set up JDK 21 (Temurin)
-      # ---------------------------------------------------------------
-      - name: Set up JDK 21 (Temurin)
+      - name: Set up JDK ${{ env.JAVA_VERSION }} (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: "temurin"
-          java-version: "21"
+          java-version: ${{ env.JAVA_VERSION }}
           cache: "gradle"
 
-      # ---------------------------------------------------------------
-      # 3 Make Gradle wrapper executable
-      # ---------------------------------------------------------------
       - name: Grant execute permission for Gradle wrapper
         run: chmod +x ./gradlew
 
-      # ---------------------------------------------------------------
-      # 4 Cache Gradle dependencies
-      # ---------------------------------------------------------------
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-
-      # ---------------------------------------------------------------
-      # Check if secrets are loading (Debugging)
-      # ---------------------------------------------------------------
-      - name: Verify Secrets Context
-        run: |
-          echo "Verificando si los secrets están llegando al runner..."
-          if [ -z "${{ secrets.DB_PASSWORD }}" ]; then
-            echo "❌ ERROR: DB_PASSWORD está vacío. GitHub no está inyectando el secret."
-          else
-            echo "✅ DB_PASSWORD detectado correctamente."
-          fi
-
-      # ---------------------------------------------------------------
-      # 5 Start PostgreSQL via docker run
-      # Using a step (not services:) so GitHub Secrets are available.
-      # ---------------------------------------------------------------
       - name: Start PostgreSQL
         run: |
           docker run -d \
@@ -96,23 +58,15 @@ jobs:
               echo "PostgreSQL is ready!"
               exit 0
             fi
-            # Check if container died
             if [ "$(docker inspect -f '{{.State.Running}}' postgres)" != "true" ]; then
-              echo "Container stopped unexpectedly. Logs:"
               docker logs postgres
               exit 1
             fi
-            echo "Waiting..."
             sleep 2
           done
-          echo "Timed out waiting for PostgreSQL. Logs:"
           docker logs postgres
           exit 1
 
-      # ---------------------------------------------------------------
-      # 6 Build and run tests
-      # Env vars override application.yaml and point to the container above.
-      # ---------------------------------------------------------------
       - name: Build and run tests
         env:
           SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5434/${{ secrets.DB_NAME }}
@@ -120,9 +74,6 @@ jobs:
           SPRING_DATASOURCE_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: ./gradlew clean build --no-daemon
 
-      # ---------------------------------------------------------------
-      # 7 Upload test reports (always, even on failure)
-      # ---------------------------------------------------------------
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -131,41 +82,55 @@ jobs:
           path: build/reports/tests/**
           retention-days: 14
 
-      # ---------------------------------------------------------------
-      # 8 Upload application JAR artifact
-      # ---------------------------------------------------------------
-      - name: Upload build artifact (JAR)
+      - name: Upload application JAR artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: application-artifact
-          path: build/libs/*.jar
+          path: build/libs/*-SNAPSHOT.jar
           retention-days: 14
 
-      # ---------------------------------------------------------------
-      # 9 Build and push Docker image (push events only)
-      # ---------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # 2 · Imagen Docker → GHCR (Artefacto inmutable)
+  # ---------------------------------------------------------------------------
+  docker:
+    name: "2 · Imagen Docker → GHCR"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Build Docker image
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
-        run: docker build --build-arg GIT_SHA=${{ github.sha }} -t acm-ecommerce:${{ github.sha }} -t acm-ecommerce:latest .
+        run: |
+          IMAGE_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          docker build \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t ghcr.io/$IMAGE_LOWER:${{ github.sha }} \
+            -t ghcr.io/$IMAGE_LOWER:latest .
 
       - name: Push Docker image to GHCR
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
-        env:
-          REGISTRY: ghcr.io
-          IMAGE_NAME: ${{ github.repository }}
         run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
-          docker tag acm-ecommerce:${{ github.sha }} $REGISTRY/$IMAGE_NAME:${{ github.sha }}
-          docker tag acm-ecommerce:latest $REGISTRY/$IMAGE_NAME:latest
-          docker push $REGISTRY/$IMAGE_NAME:${{ github.sha }}
-          docker push $REGISTRY/$IMAGE_NAME:latest
+          IMAGE_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/$IMAGE_LOWER:${{ github.sha }}
+          docker push ghcr.io/$IMAGE_LOWER:latest
 
-      # ---------------------------------------------------------------
-      # 10 Continuous Deployment (CD) - Trigger Render Deploy Hook
-      # ---------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # 3 · Desplegar en Render + Smoke Test (CD)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "3 · Desplegar en Render"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.APP_URL != ''
+
+    steps:
       - name: Trigger Render Continuous Deployment
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: |
@@ -183,3 +148,27 @@ jobs:
             exit 1
           fi
           echo "✅ Despliegue automático en Render disparado con éxito."
+
+      - name: Smoke test (/version)
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          echo "🔍 Esperando que $APP_URL/version responda con el commit $EXPECTED_SHA..."
+          for i in $(seq 1 40); do
+            RESP=$(curl -sf "$APP_URL/version" || true)
+            if [ -n "$RESP" ]; then
+              ACTUAL_SHA=$(echo "$RESP" | jq -r '.commit // empty')
+              MSG=$(echo "$RESP" | jq -r '.message // empty')
+              echo "Intento $i/40 -> commit=$ACTUAL_SHA"
+              if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
+                echo "✅ Versión '$MSG' ($ACTUAL_SHA) desplegada en $APP_URL"
+                exit 0
+              fi
+            else
+              echo "Intento $i/40 -> esperando respuesta de Render..."
+            fi
+            sleep 10
+          done
+          echo "❌ Tiempo agotado esperando el commit $EXPECTED_SHA en $APP_URL/version"
+          exit 1
