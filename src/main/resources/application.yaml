@@ -1,6 +1,6 @@
 # >>> DEMO CI/CD: cambia este texto, haz commit + push y míralo en la URL pública <<<
 app:
-  message: "Versión 1 - Hola desde el pipeline CI/CD"
+  message: "Version 2 - Hola desde el pipeline CI/CD"
 
 server:
   # Render inyecta la variable PORT; en local se usa 8080
