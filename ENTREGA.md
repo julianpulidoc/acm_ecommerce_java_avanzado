@@ -2,6 +2,8 @@
 
 **Repositorio:** https://github.com/julianpulidoc/acm_ecommerce_java_avanzado
 
+**Aplicación desplegada:** https://ecommerce-0jwb.onrender.com (versión en https://ecommerce-0jwb.onrender.com/version)
+
 **Pipeline:** https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/actions
 
 **Equipo:** [@julianpulidoc](https://github.com/julianpulidoc) · [@Julsanchezc](https://github.com/Julsanchezc) · [@dsantiag0g](https://github.com/dsantiag0g)
@@ -23,12 +25,13 @@ flowchart LR
     E --> F[URL pública]
 ```
 
-1. **CI:** GitHub Actions levanta un PostgreSQL temporal y ejecuta `./gradlew clean build`, que compila y corre la prueba de integración.
-2. **Artefacto:** construye la imagen con el SHA del commit y la publica en GHCR con los tags `<sha>` y `latest`.
-3. **CD:** si todo pasó y la rama es `main`, llama al Deploy Hook de Render.
-4. **Verificación:** la página `/` y el endpoint `/version` muestran el texto y el commit de la versión en ejecución.
+El workflow tiene 3 jobs encadenados con `needs`:
 
-Si un paso falla, los de publicación y despliegue no se ejecutan.
+1. **Compilar y probar (CI):** levanta un PostgreSQL temporal, instala Java 25 y ejecuta `./gradlew clean build`, que compila y corre la prueba de integración.
+2. **Imagen Docker → GHCR:** construye la imagen con el SHA del commit y la publica con los tags `<sha>` y `latest`.
+3. **Desplegar en Render (CD):** llama al Deploy Hook y ejecuta un smoke test que consulta `/version` hasta que devuelve el SHA del commit.
+
+Los jobs 2 y 3 solo corren con un push a `main`, y únicamente si el job anterior pasó.
 
 ## Cambios principales
 
@@ -39,6 +42,7 @@ Si un paso falla, los de publicación y despliegue no se ejecutan.
 | [`0b02d04`](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/commit/0b02d04) | Despliegue continuo hacia Render |
 | [`6ae077f`](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/commit/6ae077f) | Dockerfile multi-stage |
 | [`978e5c3`](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/commit/978e5c3) | SHA real del commit en producción |
+| [`df93052`](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/commit/df93052) | Pipeline separado en 3 jobs con smoke test |
 
 ## Decisiones técnicas
 
@@ -49,18 +53,20 @@ Si un paso falla, los de publicación y despliegue no se ejecutan.
 
 ## Evidencias
 
+Todo corresponde a la [ejecución 45887476634](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/actions/runs/45887476634) (commit `df93052`, 3 jobs en verde, 5 min 8 s):
+
 | Requisito | Evidencia |
 |---|---|
-| Disparo automático y pruebas | [Ejecución 45490791676](https://github.com/julianpulidoc/acm_ecommerce_java_avanzado/actions/runs/45490791676): evento `push`, `BUILD SUCCESSFUL`, 0 fallos, 1 min 58 s |
-| Imagen publicada | `ghcr.io/julianpulidoc/acm_ecommerce_java_avanzado`, tags `978e5c3…` y `latest` con el mismo digest |
-| Despliegue automático | Render respondió HTTP 200 (`dep-dc3020rl550s73cdbup0`) |
-| Imagen funcional | Ejecutada en local desde GHCR con 512 MB: `/` y `/version` responden 200 con el commit correcto |
+| Disparo automático y pruebas | Evento `push` a `main`; job 1 con `BUILD SUCCESSFUL` |
+| Imagen publicada | `ghcr.io/julianpulidoc/acm_ecommerce_java_avanzado`, tags `df93052…` y `latest` con el mismo digest |
+| Despliegue automático | Render respondió HTTP 200 (`dep-dc48vatg1s2s73dmaaug`) |
+| Verificación | Smoke test: `✅ Versión … (df93052…) desplegada en https://ecommerce-0jwb.onrender.com` |
 
 ## Demostración
 
 1. Cambiar `app.message` en `src/main/resources/application.yaml`.
 2. `git add -u && git commit -m "demo: cambio en vivo" && git push`
-3. Mostrar en Actions las pruebas, la imagen publicada y el despliegue.
-4. Recargar la URL pública y comparar el commit de `/version` con `git rev-parse HEAD`.
+3. Mostrar en Actions los 3 jobs: pruebas, imagen publicada, y despliegue con smoke test.
+4. Recargar https://ecommerce-0jwb.onrender.com y comparar el commit de `/version` con `git rev-parse HEAD`.
 
 **Ejecución local:** `docker compose up -d --build` y abrir http://localhost:8080
